@@ -9,11 +9,7 @@ your version against the upstream releases later.
 ## Install
 
 ```bash
-mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/nomaraba/appimage-install/main/appimage-install \
-  -o ~/.local/bin/appimage-install
-# or: wget -O ~/.local/bin/appimage-install https://raw.githubusercontent.com/nomaraba/appimage-install/main/appimage-install
-chmod +x ~/.local/bin/appimage-install
+mkdir -p ~/.local/bin && { command -v curl >/dev/null 2>&1 && curl -fsSL https://raw.githubusercontent.com/nomaraba/appimage-install/main/appimage-install -o ~/.local/bin/appimage-install || wget -qO ~/.local/bin/appimage-install https://raw.githubusercontent.com/nomaraba/appimage-install/main/appimage-install; } && chmod +x ~/.local/bin/appimage-install
 ```
 
 ## Usage
