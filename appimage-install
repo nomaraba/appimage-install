@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""appimage-install - install and update AppImages as desktop apps.
+
+Install (local file or direct URL):
+    appimage-install <path-or-url> [--name N] [--desc D] [--dest DIR]
+                     [--keep] [--version V] [--update-link URL] [--probe-version]
+
+Check for and install updates:
+    appimage-install update [name] [--yes]
+
+Read the full documentation:
+    appimage-install docs
+
+Installed apps are tracked in ~/App/apps.json.
+Update providers (currently GitHub releases only) are derived from the
+release asset URL, e.g.:
+    https://github.com/obsidianmd/obsidian-releases/releases/download/v1.15.1/Obsidian-1.15.1-arm64.AppImage
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+BIN_DIR = HOME / ".local/bin"
+APPS_DIR = HOME / ".local/share/applications"
+ICONS_DIR = HOME / ".local/share/icons/hicolor"
+DEFAULT_APP_DIR = HOME / "App"
+REPO_FILE = DEFAULT_APP_DIR / "apps.json"
+
+STD_SIZES = [16, 24, 32, 48, 64, 96, 128, 256, 512, 1024]
+MACHINE = platform.machine().lower()
+ARCH_PREF = {
+    "x86_64": ("x86_64", "x64", "amd64"),
+    "amd64": ("amd64", "x64", "x86_64"),
+    "aarch64": ("aarch64", "arm64"),
+    "arm64": ("arm64", "aarch64"),
+}.get(MACHINE, (MACHINE,))
+OTHER_ARCH = ("arm64", "aarch64", "armhf", "i686") if MACHINE in ("x86_64", "amd64") else ("x86_64", "x64", "amd64")
+
+VERSION_RE = r"v?\d+(?:\.\d+)+"
+# wider token for templating URLs: swallows prerelease suffixes like -alpha-1-20241225
+URL_VERSION_RE = r"\d+(?:\.\d+)+(?:[-._][0-9A-Za-z]+)*"
+ARCH_RE = r"(?i)(?<![a-z0-9])(x86_64|amd64|x64|arm64|aarch64|armhf|i686)(?![a-z0-9])"
+
+DOCS = """appimage-install
+
+Installs AppImage files as desktop applications and keeps them updated.
+It moves the file to ~/App, links a command into ~/.local/bin, extracts
+the icon, writes a .desktop entry, and refreshes the desktop caches.
+Every install is recorded in ~/App/apps.json, so `update` can compare
+your version against the upstream releases later.
+
+USAGE
+
+  appimage-install <file-or-url> [options]
+  appimage-install update [name] [--yes]
+  appimage-install docs
+
+INSTALL OPTIONS
+
+  <file-or-url>
+      Path to a local .AppImage, or a direct download URL. A GitHub
+      releases asset URL also becomes the update provider, so a later
+      `update` knows where to look for newer builds.
+
+  --name NAME
+      Display name in the application menu, and the command name in
+      ~/.local/bin. Default: the name written inside the AppImage.
+
+  --desc TEXT
+      Comment written to the .desktop file. Some launchers show it
+      under the app name. Default: the comment inside the AppImage,
+      or the app name if it has none.
+
+  --dest DIR
+      Install directory. Default: ~/App/<name>.
+
+  --keep
+      Copy the file instead of moving it.
+
+  --version V
+      Record this version when the filename contains none. The updater
+      needs a version to know what "newer" means.
+
+  --probe-version
+      Run `<appimage> --version` and read the version from its output.
+      Only needed when the filename has none and --version was not
+      given. It starts the app once, so a window may appear briefly.
+
+  --update-link URL
+      Track updates against this GitHub releases URL. Accepted forms:
+      an asset download URL, or the releases page of a repository.
+
+UPDATE
+
+  update
+      Check every tracked app for a newer release. Newer candidates
+      are listed as a numbered menu. Type a number to install, or
+      press Enter to cancel.
+
+  update [name]
+      Check one app.
+
+  --yes
+      Install the newest release without asking.
+
+  Version comparison reads the numbers only: 1.15.2 counts as newer
+  than 1.15.1, and a suffix such as -alpha-1-20251018 is compared as
+  its own number. Releases marked prerelease on GitHub are skipped.
+  The updater picks the asset built for this machine's architecture
+  and accepts archless asset names as a fallback. Unauthenticated
+  GitHub API calls are limited to 60 per hour.
+
+FILES
+
+  ~/App/<name>/                      installed AppImage
+  ~/App/apps.json                    install record
+  ~/.local/bin/<cmd>                 command symlink
+  ~/.local/share/applications/       .desktop entries
+  ~/.local/share/icons/hicolor/      extracted icons
+
+  To remove an app, delete its directory under ~/App, the symlink in
+  ~/.local/bin, the .desktop file, the icon, and its entry in
+  apps.json.
+
+AUTHOR
+
+Kasaki Nomaraba 
+https://github.com/nomaraba
+"""
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, cwd=None):
+    return subprocess.run(
+        cmd, cwd=cwd, check=False,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def http_get(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": "appimage-install/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def http_json(url, timeout=30):
+    return json.loads(http_get(url, timeout))
+
+
+def sanitize(text):
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", text.strip()).strip("-.")
+    return s.lower() or "app"
+
+
+def vtuple(s):
+    if not s:
+        return ()
+    return tuple(int(x) for x in re.findall(r"\d+", s))
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# repo file
+
+def load_repo():
+    if REPO_FILE.exists():
+        try:
+            data = json.loads(REPO_FILE.read_text())
+            return data.get("apps", [])
+        except (OSError, ValueError):
+            print(f"warning: could not parse {REPO_FILE}, starting fresh", file=sys.stderr)
+    return []
+
+
+def save_repo(apps):
+    REPO_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REPO_FILE.write_text(json.dumps({"apps": apps}, indent=2) + "\n")
+
+
+def upsert_repo(entry):
+    apps = load_repo()
+    apps = [a for a in apps if a.get("name") != entry["name"]]
+    apps.append(entry)
+    save_repo(apps)
+
+
+# desktop io
+
+def parse_entry(text):
+    fields = {}
+    for line in text.splitlines():
+        if line.startswith("[") and not line.startswith("[Desktop Entry]"):
+            break
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)=(.*)$", line)
+        if m:
+            fields[m.group(1)] = m.group(2).strip()
+    return fields
+
+
+def rewrite_desktop(text, symlink, icon_id, name, desc, has_name_override, has_desc_override):
+    lines = []
+    for line in text.splitlines():
+        if has_name_override and re.match(r"^Name\[.*\]=", line):
+            continue
+        if has_desc_override and re.match(r"^Comment\[.*\]=", line):
+            continue
+        if line.startswith("Exec="):
+            tokens = line[5:].split()
+            if tokens:
+                tokens[0] = str(symlink)
+            line = "Exec=" + " ".join(tokens)
+        elif line.startswith("TryExec="):
+            line = f"TryExec={symlink}"
+        elif line.startswith("Icon="):
+            line = f"Icon={icon_id}"
+        elif line.startswith("Name=") and has_name_override:
+            line = f"Name={name}"
+        elif line.startswith("Comment=") and has_desc_override:
+            line = f"Comment={desc}"
+        lines.append(line)
+
+    if not any(l.startswith("Name=") for l in lines):
+        lines.append(f"Name={name}")
+    if not any(l.startswith("Comment=") for l in lines):
+        lines.append(f"Comment={desc}")
+    if not any(l.startswith("TryExec=") for l in lines):
+        idx = next(i for i, l in enumerate(lines) if l.startswith("Exec="))
+        lines.insert(idx + 1, f"TryExec={symlink}")
+    return "\n".join(lines) + "\n"
+
+
+def png_dimensions(data):
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 24:
+        w, h = struct.unpack(">II", data[16:24])
+        return w, h
+    return None
+
+
+def nearest_size(n):
+    return min(STD_SIZES, key=lambda s: abs(s - n))
+
+
+def pick_icon(root, icon_field, fallback_id):
+    """Return (source_path, icon_id, 'scalable' | int) for the best icon."""
+    icon_id = sanitize(fallback_id)
+    candidates = []
+
+    if icon_field:
+        icon_id = sanitize(Path(icon_field).stem)
+        p = Path(icon_field)
+        if p.is_absolute():
+            p = root / str(p).lstrip("/")
+            if p.exists():
+                candidates.append(p)
+        else:
+            for ext in (".svg", ".png", ".xpm"):
+                for hit in root.rglob(f"{icon_field}{ext}"):
+                    if "icons" in hit.parts or hit.parent == root:
+                        candidates.append(hit)
+    if not candidates:
+        diricon = root / ".DirIcon"
+        if diricon.exists():
+            target = diricon if not diricon.is_symlink() else (root / diricon.readlink())
+            if target.exists():
+                candidates.append(target)
+    if not candidates:
+        for ext in (".svg", ".png", ".xpm"):
+            candidates += [p for p in root.rglob(f"*{ext}") if "icons" in p.parts]
+    if not candidates:
+        for pat in ("resources/*.png", "*.png", "*.svg"):
+            candidates += list(root.glob(pat))
+
+    svgs = [c for c in candidates if c.suffix == ".svg"]
+    if svgs:
+        return svgs[0], icon_id, "scalable"
+
+    def size_of(p):
+        m = re.search(r"(\d+)x\d+", str(p))
+        if m:
+            return int(m.group(1))
+        d = png_dimensions(p.read_bytes())
+        return max(d) if d else 0
+
+    best = max(candidates, key=size_of)
+    return best, icon_id, nearest_size(size_of(best))
+
+
+# version lookup
+
+def detect_version(path, explicit=None, probe=False):
+    if explicit:
+        return explicit
+    m = re.search(VERSION_RE, path.name)
+    if m:
+        return m.group(0).lstrip("v")
+    if probe:
+        try:
+            r = subprocess.run([str(path), "--version"], capture_output=True,
+                               text=True, timeout=20)
+            m = re.search(VERSION_RE, (r.stdout or "") + (r.stderr or ""))
+            if m:
+                return m.group(0).lstrip("v")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+# github releases API
+
+def parse_update_link(url):
+    """Accept an asset URL, a releases page, or an api releases URL.
+
+    Returns {"api": ..., "template": ...} where the template has {version}
+    and {arch} placeholders, or None if the URL is not a GitHub releases link.
+    """
+    m = re.match(r"https?://api\.github\.com/repos/([^/]+)/([^/]+)/releases", url)
+    if m:
+        return {"api": url, "template": None}
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)(/releases.*)?$", url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    api = f"https://api.github.com/repos/{owner}/{repo}/releases"
+
+    template = url.split("?")[0]
+    if re.search(VERSION_RE, template):
+        # template the directory part and the filename stem separately,
+        # so the file extension is never swallowed by a prerelease suffix
+        head, _, fname = template.rpartition("/")
+        stem, dot, ext = fname.rpartition(".")
+        head = re.sub(URL_VERSION_RE, "{version}", head)
+        stem = re.sub(URL_VERSION_RE, "{version}", stem)
+        head = re.sub(ARCH_RE, "{arch}", head)
+        stem = re.sub(ARCH_RE, "{arch}", stem)
+        template = f"{head}/{stem}{dot}{ext}" if dot else f"{head}/{stem}"
+        return {"api": api, "template": template}
+    return {"api": api, "template": None}   # releases page: match any AppImage asset
+
+
+def template_regexes(template):
+    """Asset-name regexes to try, best match first."""
+    if not template:
+        return [re.compile(r"(?i).*\.appimage$")]
+    fname = re.escape(Path(template).name)
+    out = []
+    if "{arch}" in template:
+        rx = fname.replace(re.escape("{version}"), URL_VERSION_RE)
+        rx = rx.replace(re.escape("{arch}"), r"[A-Za-z0-9_]+")
+        out.append(re.compile("(?i)^" + rx + "$"))
+        # some projects ship archless x86 assets: Obsidian-1.15.1.AppImage
+        rx2 = fname.replace(re.escape("{version}"), URL_VERSION_RE)
+        rx2 = rx2.replace(re.escape("-{arch}"), "").replace(re.escape("{arch}"), "")
+        if rx2 != rx:
+            out.append(re.compile("(?i)^" + rx2 + "$"))
+    else:
+        rx = fname.replace(re.escape("{version}"), URL_VERSION_RE)
+        out.append(re.compile("(?i)^" + rx + "$"))
+    return out
+
+
+def template_regex(template):
+    return template_regexes(template)[0]
+
+
+def score_asset(name):
+    """Prefer assets for this machine's architecture."""
+    score = 0
+    if any(a in name.lower() for a in ARCH_PREF):
+        score += 2
+    if any(a in name.lower() for a in OTHER_ARCH):
+        score -= 2
+    return score
+
+
+def find_asset(release, template):
+    regexes = template_regexes(template)
+    assets = [a for a in release.get("assets", []) if a.get("name", "").lower().endswith(".appimage")]
+    hits, seen = [], set()
+    for rx in regexes:
+        for a in assets:
+            if a["name"] not in seen and rx.match(a["name"]):
+                hits.append(a)
+                seen.add(a["name"])
+    if not hits and not template:
+        hits = assets
+    if not hits:
+        return None
+    return max(hits, key=lambda a: score_asset(a["name"]))
+
+
+def list_newer(api, template, current):
+    """Return [(version_str, date, asset_dict)] for releases newer than current."""
+    try:
+        releases = http_json(f"{api}?per_page=50")
+    except (urllib.error.URLError, ValueError) as exc:
+        print(f"warning: could not query {api}: {exc}", file=sys.stderr)
+        return []
+    out = []
+    cur = vtuple(current)
+    for rel in releases:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        ver = (rel.get("tag_name") or "").lstrip("v") or rel.get("name") or ""
+        asset = find_asset(rel, template)
+        if not asset:
+            continue
+        if current and vtuple(ver) <= cur:
+            continue
+        if not current and out:      # unknown current: only offer the latest
+            continue
+        out.append((ver.lstrip("v"), rel.get("published_at", ""), asset))
+    return out
+
+
+# install
+
+def install(args, src, entry_update=None, prior=None):
+    """Install/refresh one AppImage and return the repo entry."""
+    kind_magic = b""
+    with open(src, "rb") as f:
+        f.seek(8)
+        kind_magic = f.read(4)
+    if kind_magic[:3] != b"AI\x02":
+        die(f"{src.name} is not a type 2 AppImage")
+    if not os.access(src, os.X_OK):
+        src.chmod(0o755)
+
+    with tempfile.TemporaryDirectory(prefix="appimage-install-") as tmp:
+        workdir = Path(tmp)
+        print(f"Extracting metadata from {src.name} …")
+        result = run([str(src), "--appimage-extract"], cwd=workdir)
+        if result.returncode != 0:
+            die(f"extraction failed: {result.stderr.strip() or result.stdout.strip()[-400:]}")
+        root = workdir / "squashfs-root"
+        if not root.is_dir():
+            die("extraction produced no squashfs-root")
+
+        desktop_src = None
+        for pattern in ("*.desktop", "*/*.desktop", "*/*/*.desktop"):
+            hits = sorted(root.glob(pattern))
+            if hits:
+                desktop_src = hits[0]
+                break
+
+        text = desktop_src.read_text() if desktop_src else "[Desktop Entry]\nType=Application\n"
+        entry = parse_entry(text)
+
+        name = getattr(args, "name", None) or (prior and prior.get("name")) or entry.get("Name") or src.stem
+        cmd = sanitize(name)
+        desc = getattr(args, "desc", None) or (prior and prior.get("desc")) or entry.get("Comment") or name
+        icon_field = entry.get("Icon", "")
+
+        icon_path, icon_id, icon_size = pick_icon(root, icon_field, name)
+        icon_dest = None
+        if icon_path:
+            if icon_size == "scalable":
+                icon_dest = ICONS_DIR / "scalable/apps" / f"{icon_id}.svg"
+            else:
+                icon_dest = ICONS_DIR / f"{icon_size}x{icon_size}/apps" / f"{icon_id}{icon_path.suffix}"
+            icon_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(icon_path, icon_dest)
+            print(f"icon: {icon_dest}")
+        else:
+            print("no icon found in AppImage")
+
+    if prior and prior.get("appimage"):
+        dest_dir = Path(prior["appimage"]).parent
+    elif getattr(args, "dest", None):
+        dest_dir = Path(args.dest).expanduser()
+    else:
+        dest_dir = DEFAULT_APP_DIR / name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+
+    if dest != src:
+        if getattr(args, "keep", False):
+            shutil.copy2(src, dest)
+            print(f"copied to {dest}")
+        else:
+            shutil.move(str(src), dest)
+            print(f"moved to {dest}")
+    else:
+        print(f"already at {dest}")
+    if not os.access(dest, os.X_OK):
+        dest.chmod(0o755)
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    symlink = BIN_DIR / cmd
+    if symlink.is_symlink() or symlink.exists():
+        symlink.unlink()
+    symlink.symlink_to(dest)
+    print(f"command: {symlink} -> {dest}")
+
+    final = rewrite_desktop(
+        text, symlink, icon_id, name, desc,
+        getattr(args, "name", None) is not None and not prior,
+        getattr(args, "desc", None) is not None,
+    )
+    APPS_DIR.mkdir(parents=True, exist_ok=True)
+    desktop_id = desktop_src.name if desktop_src and re.match(
+        r"^[A-Za-z0-9._-]+\.desktop$", desktop_src.name
+    ) else f"{cmd}.desktop"
+    desktop_dest = APPS_DIR / desktop_id
+    desktop_dest.write_text(final)
+    print(f"desktop entry: {desktop_dest}")
+
+    run(["update-desktop-database", str(APPS_DIR)])
+    run(["gtk-update-icon-cache", "-f", "-t", str(ICONS_DIR)])
+    run(["kbuildsycoca6", "--noincremental"])
+    if shutil.which("desktop-file-validate") and run(["desktop-file-validate", str(desktop_dest)]).returncode == 0:
+        print("desktop file: valid")
+
+    update = entry_update or (prior and prior.get("update"))
+    record = {
+        "name": name,
+        "cmd": cmd,
+        "appimage": str(dest),
+        "desktop": desktop_id,
+        "icon": icon_id if icon_dest else None,
+        "desc": desc,
+        "version": detect_version(dest, getattr(args, "version", None), getattr(args, "probe_version", False)),
+        "update": update,
+        "installed": now_iso(),
+    }
+    upsert_repo(record)
+
+    old = prior and prior.get("appimage")
+    if old and old != record["appimage"]:
+        try:
+            Path(old).unlink()
+            print(f"removed old build: {old}")
+        except OSError:
+            pass
+
+    print(f"\nInstalled '{name}' — run it as '{cmd}' or from the application menu.")
+    return record
+
+
+# update
+
+def ask_choice(prompt, options):
+    if not sys.stdin.isatty():
+        return None
+    try:
+        raw = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    if 1 <= n <= len(options):
+        return options[n - 1]
+    return None
+
+
+def cmd_update(args):
+    apps = [a for a in load_repo() if a.get("name")]
+    if args.name:
+        apps = [a for a in apps if a["name"].lower() == args.name.lower()]
+        if not apps:
+            die(f"'{args.name}' is not tracked in {REPO_FILE}")
+    if not apps:
+        die(f"nothing tracked in {REPO_FILE} yet")
+
+    for app in apps:
+        upd = app.get("update")
+        if not upd or not upd.get("api"):
+            print(f"{app['name']}: no update provider (--update-link was never set), skipping")
+            continue
+
+        current = app.get("version") or detect_version(Path(app["appimage"]))
+        if not current and args.name:
+            die(f"cannot determine the current version of {app['name']} "
+                f"(not in {REPO_FILE} and not in the filename)")
+
+        newer = list_newer(upd["api"], upd.get("template"), current)
+        label = f"{app['name']} (current {current})" if current else app["name"]
+        if not newer:
+            print(f"{label}: up to date")
+            continue
+
+        print(f"\nUpdates for {label}:")
+        for i, (ver, date, asset) in enumerate(newer, 1):
+            day = date.split("T")[0] if date else "?"
+            print(f"  {i}. {ver}  {day}  {asset['name']}")
+
+        pick = newer[0] if args.yes else ask_choice(
+            "Install which? [number, Enter=cancel]: ", newer
+        )
+        if pick is None:
+            print(f"{app['name']}: skipped")
+            continue
+        ver, _, asset = pick
+        print(f"Downloading {asset['name']} …")
+        try:
+            data = http_get(asset["browser_download_url"], timeout=600)
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"warning: download failed: {exc}", file=sys.stderr)
+            continue
+
+        with tempfile.TemporaryDirectory(prefix="appimage-update-") as tmp:
+            dl = Path(tmp) / asset["name"]
+            dl.write_bytes(data)
+            record = install(args, dl, entry_update=upd, prior=app)
+
+        if record["version"] != ver and not record["version"]:
+            record["version"] = ver
+            upsert_repo(record)
+    return 0
+
+
+def cmd_docs():
+    if sys.stdout.isatty():
+        pager = os.environ.get("PAGER") or shutil.which("less") or shutil.which("more")
+        if pager:
+            try:
+                return subprocess.run([pager], input=DOCS, text=True).returncode
+            except FileNotFoundError:
+                pass
+    sys.stdout.write(DOCS)
+    return 0
+
+
+def main():
+    first = sys.argv[1] if len(sys.argv) > 1 else ""
+    if first == "docs":
+        return cmd_docs()
+    if first == "update":
+        ap = argparse.ArgumentParser(prog="appimage-install update",
+                                     description="Check tracked apps for newer releases.")
+        ap.add_argument("name", nargs="?", help="app name; omit to check all tracked apps")
+        ap.add_argument("--yes", action="store_true", help="install the newest release without asking")
+        args = ap.parse_args(sys.argv[2:])
+        return cmd_update(args)
+
+    ap = argparse.ArgumentParser(prog="appimage-install",
+                                 description="Install an AppImage as a desktop app.")
+    ap.add_argument("appimage", help="path to a local .AppImage or a direct URL")
+    ap.add_argument("--name", help="display name (default: name from the AppImage)")
+    ap.add_argument("--desc", help="comment/description written to the .desktop file")
+    ap.add_argument("--dest", help=f"install directory (default: {DEFAULT_APP_DIR})")
+    ap.add_argument("--keep", action="store_true", help="copy instead of moving the file")
+    ap.add_argument("--version", help="app version, if the filename does not contain one")
+    ap.add_argument("--probe-version", action="store_true",
+                    help="run '<appimage> --version' to detect the version")
+    ap.add_argument("--update-link", metavar="URL",
+                    help="GitHub releases URL to track updates against")
+    args = ap.parse_args()
+
+    src_arg = args.appimage
+    update = None
+    if args.update_link:
+        update = parse_update_link(args.update_link)
+        if update is None:
+            die(f"--update-link {args.update_link} is not a GitHub releases URL")
+
+    if re.match(r"^https?://", src_arg):
+        derived = parse_update_link(src_arg)
+        if derived and not update:
+            update = derived
+        print(f"Downloading {src_arg} …")
+        try:
+            data = http_get(src_arg, timeout=600)
+        except (urllib.error.URLError, OSError) as exc:
+            die(f"download failed: {exc}")
+        with tempfile.TemporaryDirectory(prefix="appimage-dl-") as tmp:
+            src = Path(tmp) / Path(src_arg.split("?")[0]).name or "download.AppImage"
+            src.write_bytes(data)
+            install(args, src, entry_update=update)
+            return 0
+    else:
+        src = Path(src_arg).expanduser().resolve()
+        if not src.is_file():
+            die(f"{src} does not exist")
+        install(args, src, entry_update=update)
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
