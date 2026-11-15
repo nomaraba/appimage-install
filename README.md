@@ -10,7 +10,6 @@ your version against the upstream releases later.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nomaraba/appimage-install/main/setup.sh | sh
-# or: wget -qO- https://raw.githubusercontent.com/nomaraba/appimage-install/main/setup.sh | sh
 ```
 
 ## Usage
